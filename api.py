@@ -8,35 +8,41 @@ from pathlib import Path
 import utils
 import runner
 from problem import Problem
+import os
 
 DEVEL_IMAGE_NAME = "nvidia/cuda:12.8.0-devel-ubuntu22.04"
 RUNTIME_IMAGE_NAME = "nvidia/cuda:12.8.0-runtime-ubuntu22.04"
 CURR_DIR = Path(__file__).parent
 
-PIP_PACKAGES = ["torch", "numpy", "fastapi[standard]"]
-LOCAL_SOURCE = ["problems", "utils", "runner", "problem"]
+
+PIP_PACKAGES = ["torch", "numpy", "fastapi[standard]", "triton"]
+LOCAL_SOURCE = ["utils", "runner", "problem"]
 
 devel_image = (
     modal.Image.from_registry(DEVEL_IMAGE_NAME, add_python="3.11")
+    .apt_install(["build-essential", "gcc", "g++"])
+    .env({"CC": "gcc"})
     .pip_install(PIP_PACKAGES)
     .add_local_python_source(*LOCAL_SOURCE)
 )
 
 runtime_image = (
     modal.Image.from_registry(RUNTIME_IMAGE_NAME, add_python="3.11")
+    .apt_install(["build-essential", "gcc", "g++"])
+    .env({"CC": "gcc"})
     .pip_install(PIP_PACKAGES)
     .add_local_python_source(*LOCAL_SOURCE)
 )
 
-app = modal.App("tensara-engine", image=devel_image)
+app = modal.App("tensara", image=devel_image)
 web_app = FastAPI()
 
-def binary_runner(type: str, compiled_lib: bytes, problem_name: str):
+def binary_runner(type: str, compiled_lib: bytes, solution_code: str, problem_name: str, problem_def: str, dtype: str, language: str):
     gen = None
     if type == "checker":
-        gen = runner.run_checker(problem_name, compiled_lib)
+        gen = runner.run_checker(problem_name, problem_def, compiled_lib, solution_code, dtype, language)
     elif type == "benchmark":
-        gen = runner.run_benchmark(problem_name, compiled_lib)
+        gen = runner.run_benchmark(problem_name, problem_def, compiled_lib, solution_code, dtype, language)
     else:
         raise ValueError(f"Unknown binary type: {type}")
 
@@ -68,6 +74,9 @@ async def checker(gpu: str, request: Request):
         return 404
 
     solution_code = req["solution_code"]
+    problem_def = req["problem_def"]
+    dtype = req["dtype"]
+    language = req["language"]
     problem_name = utils.convert_slug_to_module_name(req["problem"])
 
     def create_stream():
@@ -79,29 +88,34 @@ async def checker(gpu: str, request: Request):
             except Exception:
                 pass
         
-        bench_thr = Thread(target=compile_benchmark)
-        bench_thr.start()
 
-        try:
-            checker_compiled = utils.run_nvcc_and_return_bytes(gpu, solution_code, "checker")
-        except utils.NVCCError as e:
-            yield {
-                "status": "error",
-                "error": "Compilation failed",
-                "details": e.args[0],
-                "test_results": [],
-                "passed_tests": 0,
-                "total_tests": 0,
-            }
-            return
+        if language == "cuda":
+            bench_thr = Thread(target=compile_benchmark)
+            bench_thr.start()
 
-        bench_thr.join()
+            try:
+                checker_compiled = utils.run_nvcc_and_return_bytes(gpu, solution_code, "checker")
+            except utils.NVCCError as e:
+                yield {
+                    "status": "error",
+                    "error": "Compilation failed",
+                    "details": e.args[0],
+                    "test_results": [],
+                    "passed_tests": 0,
+                    "total_tests": 0,
+                }
+                return
+
+            bench_thr.join()
+        else:
+            checker_compiled = None
+
         runner = gpu_runners[gpu]
-        stream = runner.remote_gen("checker", checker_compiled, problem_name)
+        stream = runner.remote_gen("checker", checker_compiled, solution_code, problem_name, problem_def, dtype, language)
         for event in stream:
             yield event
 
-    stream = utils.async_wrap_iter(gen_wrapper(create_stream()))
+    stream = gen_wrapper(create_stream())
     return StreamingResponse(stream, media_type="text/event-stream")
 
 
@@ -112,25 +126,32 @@ async def benchmark(gpu: str, request: Request):
         return 404
 
     solution_code = req["solution_code"]
+    problem_def = req["problem_def"]
+    dtype = req["dtype"]
+
+    language = req["language"]
     problem_name = utils.convert_slug_to_module_name(req["problem"])
 
     def create_stream():
         yield {"status": "compiling"}
-        
-        try:
-            benchmark_compiled = utils.run_nvcc_and_return_bytes(gpu, solution_code, "benchmark")
-        except utils.NVCCError as e:
-            yield { 
-                "status": "error",
-                "error": "Compilation failed",
-                "details": e.args[0],
-            }
-            return
+
+        if language == "cuda":
+            try:
+                benchmark_compiled = utils.run_nvcc_and_return_bytes(gpu, solution_code, "benchmark")
+            except utils.NVCCError as e:
+                yield { 
+                    "status": "error",
+                    "error": "Compilation failed",
+                    "details": e.args[0],
+                }
+                return
+        else:
+            benchmark_compiled = None
 
         runner = gpu_runners[gpu]
         first_test_passed = False
 
-        checker_stream = runner.remote_gen("checker", benchmark_compiled, problem_name)
+        checker_stream = runner.remote_gen("checker", benchmark_compiled, solution_code, problem_name, problem_def, dtype, language)
         for event in checker_stream:
             if event["status"] == "test_result":
                 first_test_passed = event["result"]["status"] == "PASSED"
@@ -148,17 +169,14 @@ async def benchmark(gpu: str, request: Request):
             return
         
         yield {"status": "sanity_check", "message": "Sanity check passed, starting benchmark..."}
-
-        stream = runner.remote_gen("benchmark", benchmark_compiled, problem_name)
+        
+        stream = runner.remote_gen("benchmark", benchmark_compiled, solution_code, problem_name, problem_def, dtype, language)
         for event in stream:
             yield event
     
-    stream = utils.async_wrap_iter(gen_wrapper(create_stream()))
+    stream = gen_wrapper(create_stream())
     return StreamingResponse(stream, media_type="text/event-stream")
 
-@web_app.get("/welcome")
-async def welcome():
-    return {"message": "Welcome to the Tensara Engine!"}
 
 @app.function()
 @modal.asgi_app()

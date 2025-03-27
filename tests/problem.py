@@ -10,8 +10,7 @@ class gemm_relu(Problem):
     
     def __init__(self):
         super().__init__(
-            name="gemm-relu",
-            description="Implement a CUDA kernel for matrix multiplication with bias addition and ReLU activation"
+            name="gemm-relu"
         )
     
     def reference_solution(self, input_matrix: torch.Tensor, weights: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -26,9 +25,10 @@ class gemm_relu(Problem):
         Returns:
             Result of ReLU(input_matrix @ weights.T + bias)
         """
-        with torch.no_grad():
+
+        with torch.no_grad(), torch.autocast("cuda", enabled=False, dtype=torch.float32):
             # Matrix multiplication: (B, N) @ (N, M) -> (B, M)
-            result = torch.matmul(input_matrix, weights.t())
+            result = torch.mm(input_matrix, weights.t())
             # Add bias: (B, M) + (M) -> (B, M)
             result = result + bias
             # Apply ReLU activation
@@ -36,7 +36,7 @@ class gemm_relu(Problem):
             
             return result
     
-    def generate_test_cases(self) -> List[Dict[str, Any]]:
+    def generate_test_cases(self, dtype: torch.dtype) -> List[Dict[str, Any]]:
         """
         Generate test cases for GEMM with Bias and ReLU.
         
@@ -45,29 +45,31 @@ class gemm_relu(Problem):
         """
         
         test_configs = [
-            ("Config 1", 1024, 1024, 1024),
-            ("Config 2", 2048, 1024, 1024),
-            ("Config 3", 4096, 1024, 1024),
-            ("Config 4", 6144, 1024, 1024)
+            (512, 6144, 1024),
+            (512, 8192, 1024),
+            (512, 8192, 2048),
+            (1024, 1024, 1024),
+            (1024, 4096, 1024),
+            (1024, 4096, 2048)
         ]
         
         return [
             {
-                "name": f"{name} (B={batch_size}, N={in_features}, M={out_features})",
+                "name": f"B={batch_size}, N={in_features}, M={out_features}",
                 "batch_size": batch_size,
                 "in_features": in_features,
                 "out_features": out_features,
                 "create_inputs": lambda b=batch_size, n=in_features, m=out_features: (
-                    torch.rand((b, n), device="cuda", dtype=torch.float32) * 20.0 - 10.0,  # uniform [-10, 10]
-                    torch.randn((m, n), device="cuda", dtype=torch.float32),               # normal (0, 1)
-                    torch.rand((m), device="cuda", dtype=torch.float32) * 200.0 - 100.0    # uniform [-100, 100]
+                    torch.rand((b, n), device="cuda", dtype=dtype) * 2 - 1,
+                    torch.rand((m, n), device="cuda", dtype=dtype) * 2 - 1,  
+                    torch.rand((m), device="cuda", dtype=dtype) * 2 - 1  
                 )
             }
-            for name, batch_size, in_features, out_features in test_configs
+            for batch_size, in_features, out_features in test_configs
         ]
     
     def verify_result(self, expected_output: torch.Tensor, 
-                     actual_output: torch.Tensor) -> Tuple[bool, Dict[str, Any]]:
+                     actual_output: torch.Tensor, dtype: torch.dtype) -> Tuple[bool, Dict[str, Any]]:
         """
         Verify if the GEMM with Bias and ReLU result is correct.
         
@@ -78,7 +80,7 @@ class gemm_relu(Problem):
         Returns:
             Tuple of (is_correct, debug_info)
         """
-        is_close = torch.allclose(actual_output, expected_output, rtol=1e-5, atol=1e-5)
+        is_close = torch.allclose(actual_output, expected_output, rtol=1e-4, atol=1e-3)
         
         debug_info = {}
         if not is_close:

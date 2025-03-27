@@ -1,20 +1,18 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Tuple, Any, Optional
-
+import torch
 
 class Problem(ABC):
-    """Base class for defining CUDA problems."""
+    """Base class for defining problems."""
     
-    def __init__(self, name: str, description: str):
+    def __init__(self, name: str):
         """
-        Initialize a CUDA problem.
+        Initialize a problem.
         
         Args:
             name: Name of the problem
-            description: Problem description
         """
         self.name = name
-        self.description = description
     
     @abstractmethod
     def reference_solution(self, *args, **kwargs) -> Any:
@@ -24,7 +22,7 @@ class Problem(ABC):
         pass
     
     @abstractmethod
-    def generate_test_cases(self) -> List[Dict[str, Any]]:
+    def generate_test_cases(self, dtype: torch.dtype) -> List[Dict[str, Any]]:
         """
         Generate test cases for this problem.
         
@@ -34,7 +32,7 @@ class Problem(ABC):
         pass
     
     @abstractmethod
-    def verify_result(self, expected_output: Any, actual_output: Any) -> Tuple[bool, Dict[str, Any]]:
+    def verify_result(self, expected_output: torch.Tensor, actual_output: torch.Tensor, dtype: torch.dtype) -> Tuple[bool, Dict[str, Any]]:
         """
         Verify if the actual output matches the expected output.
         

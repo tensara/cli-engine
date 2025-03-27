@@ -12,14 +12,23 @@ import statistics
 import subprocess
 import tempfile
 from pathlib import Path
+import importlib.util
+from types import ModuleType
 
 
+DTYPE_MAP = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 GPU_COMPUTE_CAPABILITIES = {
     "T4": "75",
     "H100": "90",
     "A100-80GB": "80",
     "A10G": "86",
+    "L40S": "89",
+    "L4": "89"
 }
 
 class NVCCError(Exception):
@@ -132,30 +141,37 @@ def read_bytes_as_cuda_lib(compiled_lib: bytes):
     return cuda_lib
 
 
-def load_problem_module(problem_type: str) -> Problem:
+def load_problem_module(problem_type: str, problem_def: str = None) -> Problem:
     """
-    Load a Problem module from the pre-imported problems module.
+    Load a Problem module either from a string definition or from pre-imported problems.
     
     Args:
         problem_type: String identifier for the problem (e.g., "matrix_multiplication")
+        problem_def: Optional string containing the Python module definition
         
     Returns:
         An instantiated Problem subclass
     
     Raises:
-        HTTPException: If the problem type cannot be found
+        HTTPException: If the problem type cannot be found or loaded
     """
     try:
-        module_name = f"problems.{problem_type}"
-        module = importlib.import_module(module_name)
-        
-        problem_class = getattr(module, problem_type)
-        return problem_class()
+        if problem_def is not None:
+            spec = importlib.util.spec_from_loader(
+                problem_type,
+                loader=None,
+                origin="<string>"
+            )
+            module = ModuleType(spec.name)
+            exec(problem_def, module.__dict__)
+            
+            problem_class = getattr(module, problem_type)
+            return problem_class()
     
-    except AttributeError as e:
+    except Exception as e:
         raise HTTPException(
             status_code=404, 
-            detail=f"Problem type '{problem_type}' not found: {str(e)}"
+            detail=f"Problem type '{problem_type}' not found or failed to load: {str(e)}"
         )
 
 def prepare_gpu():
@@ -175,18 +191,20 @@ def prepare_gpu():
     
     time.sleep(0.5)
 
-def run_dynamic_benchmark(cuda_lib, problem, test_case, input_tensors, actual_output, 
-                          min_iterations=5, max_iterations=15, target_cv=0.02, long_kernel_threshold=1.0):
+
+def run_dynamic_benchmark(solution_func, problem, test_id, test_case, input_tensors, actual_output, 
+                          language="cuda", min_iterations=5, max_iterations=15, target_cv=0.02, long_kernel_threshold=1.0):
     """
     Run a CUDA benchmark with dynamic stopping based on GFLOPS variance.
     If kernel execution time exceeds threshold, run fixed number of iterations instead.
     
     Args:
-        cuda_lib: CUDA library with the solution function
+        solution_func: CUDA library with the solution function
         problem: Problem definition with verification methods
         test_case: The specific test case to benchmark
         input_tensors: Input tensors for the CUDA function
         actual_output: Output tensor for the CUDA function
+        language: Programming language of the solution ("cuda" or "python")
         min_iterations: Minimum number of iterations to run
         max_iterations: Maximum number of iterations to run
         target_cv: Target coefficient of variation to achieve
@@ -197,7 +215,7 @@ def run_dynamic_benchmark(cuda_lib, problem, test_case, input_tensors, actual_ou
     """
     # Prepare pointers for CUDA
     input_ptrs = [ctypes.cast(tensor.data_ptr(), ctypes.POINTER(ctypes.c_float)) 
-                 for tensor in input_tensors]
+        for tensor in input_tensors if isinstance(tensor, torch.Tensor)]
     output_ptr = ctypes.cast(actual_output.data_ptr(), ctypes.POINTER(ctypes.c_float))
     extra_params = problem.get_extra_params(test_case)
     
@@ -205,14 +223,17 @@ def run_dynamic_benchmark(cuda_lib, problem, test_case, input_tensors, actual_ou
     flops = problem.get_flops(test_case)
     
     # Warm up run
-    cuda_lib.solution(*(input_ptrs + [output_ptr] + extra_params))
+    prepare_gpu()
     torch.cuda.synchronize()
     
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     
     start_event.record()
-    cuda_lib.solution(*(input_ptrs + [output_ptr] + extra_params))
+    if language == "cuda":
+        solution_func(*(input_ptrs + [output_ptr] + extra_params))
+    elif language == "python":
+        solution_func(*(list(input_tensors) + [actual_output] + list(extra_params)))
     end_event.record()
     torch.cuda.synchronize()
     
@@ -240,7 +261,10 @@ def run_dynamic_benchmark(cuda_lib, problem, test_case, input_tensors, actual_ou
         start_event.record()
         
         # Run the kernel
-        cuda_lib.solution(*(input_ptrs + [output_ptr] + extra_params))
+        if language == "cuda":
+            solution_func(*(input_ptrs + [output_ptr] + extra_params))
+        elif language == "python":
+            solution_func(*(list(input_tensors) + [actual_output] + list(extra_params)))
         
         # End timing
         end_event.record()
@@ -266,28 +290,19 @@ def run_dynamic_benchmark(cuda_lib, problem, test_case, input_tensors, actual_ou
                 if cv < target_cv:
                     break
 
-    
     if len(runtimes) > 1:
         mean_runtime = statistics.mean(runtimes)
-        stdev_runtime = statistics.stdev(runtimes)
-        min_runtime = min(runtimes)
     else:
         mean_runtime = runtimes[0]
-        stdev_runtime = 0
-        min_runtime = runtimes[0]
 
     mean_gflops = statistics.mean(gflops_measurements)
-    min_gflops = min(gflops_measurements)
-    if len(gflops_measurements) > 1:
-        stdev_gflops = statistics.stdev(gflops_measurements)
-    else:
-        stdev_gflops = 0
-    
+
     benchmark_result = {
+        "name": test_case["name"],
+        "test_id": test_id,
         "status": "PASSED",
         "gflops": mean_gflops,
-        "runtime_ms": mean_runtime * 1000,
-        "stdev_gflops": stdev_gflops,
+        "runtime_ms": mean_runtime * 1000
     }
     
     return benchmark_result
@@ -297,40 +312,4 @@ def convert_slug_to_module_name(slug: str) -> str:
     Convert a problem slug to a module name
     """
     return slug.replace("-", "_")
-
-def async_wrap_iter(it):
-    """
-    Wrap blocking iterator into an asynchronous one
-
-    From: https://stackoverflow.com/questions/62294385/synchronous-generator-in-asyncio
-    """
-    loop = asyncio.get_event_loop()
-    q = asyncio.Queue(1)
-    exception = None
-    _END = object()
-
-    async def yield_queue_items():
-        while True:
-            next_item = await q.get()
-            if next_item is _END:
-                break
-            yield next_item
-        if exception is not None:
-            # the iterator has raised, propagate the exception
-            raise exception
-
-    def iter_to_queue():
-        nonlocal exception
-        try:
-            for item in it:
-                # This runs outside the event loop thread, so we
-                # must use thread-safe API to talk to the queue.
-                asyncio.run_coroutine_threadsafe(q.put(item), loop).result()
-        except Exception as e:
-            exception = e
-        finally:
-            asyncio.run_coroutine_threadsafe(q.put(_END), loop).result()
-
-    threading.Thread(target=iter_to_queue).start()
-    return yield_queue_items()
 
