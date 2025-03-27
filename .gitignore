@@ -1,0 +1,8 @@
+python_engine/__pycache__
+python_engine/venv
+python_engine/build
+python_engine/dist
+python_engine/python_engine.egg-info
+python_engine/python_engine.egg-info
+.venv
+__pycache__
